@@ -4,7 +4,7 @@ import scipy
 from main import Task
 
 # example of testing a specific task
-id = 5
+id = 99
 T = Task(id)                # initialize task
 T.plan_path()               # path planning
 T.visualize_path()          # path visualization
