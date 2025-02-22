@@ -1,10 +1,11 @@
 import numpy as np
+import math
 import heapq as hq
 from typing import List, Tuple, Optional
 import scipy
 
 def heuristic(start: Tuple[int, int], end: Tuple[int, int]):
-    return (start[0] - end[0]) ** 2 + (start[1] - end[1]) ** 2
+    return math.sqrt((start[0] - end[0]) ** 2 + (start[1] - end[1]) ** 2)
 
 def a_star(grid, start, end):
     rows, cols = len(grid), len(grid[0])
