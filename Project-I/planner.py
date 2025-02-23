@@ -2,7 +2,6 @@ import numpy as np
 import math
 import heapq as hq
 from typing import List, Tuple, Optional
-import scipy
 
 def heuristic(start: Tuple[int, int], end: Tuple[int, int]):
     return math.sqrt((start[0] - end[0]) ** 2 + (start[1] - end[1]) ** 2)
@@ -47,26 +46,9 @@ def a_star(grid, start, end):
     return None
 
 def plan_path(world: np.ndarray, start: Tuple[int, int], end: Tuple[int, int]) -> Optional[np.ndarray]:
-    """
-    Computes a path from the start position to the end position 
-    using a certain planning algorithm (DFS is provided as an example).
-
-    Parameters:
-    - world (np.ndarray): A 2D numpy array representing the grid environment.
-      - 0 represents a walkable cell.
-      - 1 represents an obstacle.
-    - start (Tuple[int, int]): The (row, column) coordinates of the starting position.
-    - end (Tuple[int, int]): The (row, column) coordinates of the goal position.
-
-    Returns:
-    - np.ndarray: A 2D numpy array where each row is a (row, column) coordinate of the path.
-      The path starts at 'start' and ends at 'end'. If no path is found, returns None.
-    """
-    # Ensure start and end positions are tuples of integers
     start = (int(start[0]), int(start[1]))
     end = (int(end[0]), int(end[1]))
 
-    # Convert the numpy array to a list of lists for compatibility with the example DFS function
     world_list: List[List[int]] = world.tolist()
 
     path = a_star(world_list, start, end)
