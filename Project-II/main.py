@@ -104,7 +104,7 @@ class Task:
 
     def check_action(self, state, action):
         state_ = state + action
-        is_valid_action = np.all(action<=1) and np.min(action)>=0
+        is_valid_action = np.all(abs(action)<=1)
         is_inbound = np.min(state_)>=0 and np.max(state_)<=29
 
         return is_valid_action and is_inbound
