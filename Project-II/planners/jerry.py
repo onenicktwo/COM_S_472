@@ -1,21 +1,25 @@
 import numpy as np
-from typing import Tuple, Optional, List
 import heapq
+from typing import Tuple, Optional, List
 
 class PlannerAgent:
+    pursuer_history = []
+    target_history = []
     last_positions = []
-    tom_history = []  # Store recent Tom positions
-    spike_history = [] # Store recent Spike positions
-    history_length = 3  # How many past positions to track
+    history_length = 3
 
     @staticmethod
-    def get_all_actions():
+    def get_all_actions() -> List[np.ndarray]:
         return [np.array([dr, dc]) for dr in [-1, 0, 1] for dc in [-1, 0, 1]]
 
     @staticmethod
     def is_valid(pos: Tuple[int, int], world: np.ndarray) -> bool:
         r, c = pos
-        return 0 <= r < world.shape[0] and 0 <= c < world.shape[1] and world[r, c] == 0
+        return (
+            0 <= r < world.shape[0] and
+            0 <= c < world.shape[1] and
+            world[r, c] == 0
+        )
 
     @staticmethod
     def manhattan(a: Tuple[int, int], b: Tuple[int, int]) -> int:
@@ -24,44 +28,43 @@ class PlannerAgent:
     @staticmethod
     def neighbors(pos: Tuple[int, int], world: np.ndarray) -> List[Tuple[int, int]]:
         return [
-            (pos[0] + a[0], pos[1] + a[1])
-            for a in PlannerAgent.get_all_actions()
-            if PlannerAgent.is_valid((pos[0] + a[0], pos[1] + a[1]), world)
+            (pos[0] + move[0], pos[1] + move[1])
+            for move in PlannerAgent.get_all_actions()
+            if PlannerAgent.is_valid((pos[0] + move[0], pos[1] + move[1]), world)
         ]
 
     @staticmethod
-    def predict_agent(current_pos: Tuple[int, int], history: List[Tuple[int, int]], target: Tuple[int, int], world: np.ndarray) -> Tuple[int, int]:
-        """Predicts the next position of an agent (Tom or Spike)."""
-
-        # 1. One-step greedy prediction (towards their target)
+    def predict_agent(current_pos: Tuple[int, int], history: List[Tuple[int, int]],
+                      target: Tuple[int, int], world: np.ndarray) -> Tuple[int, int]:
+        # Greedy prediction (1-step toward target)
         best_pos = current_pos
         best_dist = PlannerAgent.manhattan(current_pos, target)
         for n in PlannerAgent.neighbors(current_pos, world):
             d = PlannerAgent.manhattan(n, target)
             if d < best_dist:
-                best_dist = d
                 best_pos = n
+                best_dist = d
 
-        # 2. Velocity-based prediction (using recent history)
+        # Velocity-based prediction (if enough history)
         if len(history) >= 2:
-            # Calculate the average velocity over the last few steps
-            velocity = np.array(history[-1], dtype=float) - np.array(history[-2], dtype=float)
-            predicted_pos_vel = tuple((np.array(current_pos) + velocity).astype(int))
+            velocity = np.array(history[-1]) - np.array(history[-2])
+            predicted = tuple((np.array(current_pos) + velocity).astype(int))
+            if PlannerAgent.is_valid(predicted, world):
+                return predicted
 
-            # If the velocity-predicted position is valid, use it with a higher weight
-            if PlannerAgent.is_valid(predicted_pos_vel, world):
-              return predicted_pos_vel
-
-        return best_pos # Otherwise return the one-step greedy
+        return best_pos
 
     @staticmethod
     def count_escape_routes(pos: Tuple[int, int], world: np.ndarray) -> int:
-        return sum(1 for a in PlannerAgent.get_all_actions()
-                   if np.any(a) and PlannerAgent.is_valid((pos[0] + a[0], pos[1] + a[1]), world))
+        return sum(
+            1 for move in PlannerAgent.get_all_actions()
+            if np.any(move) and PlannerAgent.is_valid((pos[0] + move[0], pos[1] + move[1]), world)
+        )
 
     @staticmethod
     def a_star(start: Tuple[int, int], goal: Tuple[int, int], world: np.ndarray,
-               predicted_tom: Tuple[int, int], avoid_tom: bool = True) -> Optional[np.ndarray]:  # Use predicted Tom
+               predicted_pursuer: Tuple[int, int], avoid_pursuer: bool = True,
+               trap_mode: bool = False, flanking_penalty: float = 0.0) -> Optional[np.ndarray]:
         frontier = []
         heapq.heappush(frontier, (0, start))
         came_from = {start: None}
@@ -74,8 +77,22 @@ class PlannerAgent:
 
             for neighbor in PlannerAgent.neighbors(current, world):
                 new_cost = cost_so_far[current] + 1
-                if avoid_tom and PlannerAgent.manhattan(neighbor, predicted_tom) <= 2:
-                    new_cost += 5  # heavily discourage being near Tom
+
+                # pursuer avoidance
+                if avoid_pursuer and PlannerAgent.manhattan(neighbor, predicted_pursuer) <= 2:
+                    new_cost += 5
+
+                # Penalize low escape options (dead ends)
+                escape = PlannerAgent.count_escape_routes(neighbor, world)
+                if escape < 3:
+                    new_cost += (3 - escape) * 2
+
+                # Flanking penalty (if we're between pursuer and target)
+                new_cost += flanking_penalty * 3
+
+                # Encourage aggression if target is trapped
+                if trap_mode:
+                    new_cost -= 1
 
                 if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
                     cost_so_far[neighbor] = new_cost
@@ -86,7 +103,7 @@ class PlannerAgent:
         if goal not in came_from:
             return np.array([0, 0])  # No path
 
-        # Reconstruct path to get first move
+        # Reconstruct path
         current = goal
         while came_from[current] != start:
             current = came_from[current]
@@ -94,36 +111,34 @@ class PlannerAgent:
                 return np.array([0, 0])
         return np.array([current[0] - start[0], current[1] - start[1]])
 
-
     @staticmethod
     def plan_action(world: np.ndarray,
                     current: np.ndarray,
-                    pursued: np.ndarray,  # Spike
-                    pursuer: np.ndarray   # Tom
+                    pursued: np.ndarray,  # target
+                    pursuer: np.ndarray   # pursuer
                     ) -> Optional[np.ndarray]:
 
         cur = tuple(current)
-        spike = tuple(pursued)
-        tom = tuple(pursuer)
+        target = tuple(pursued)
+        pursuer = tuple(pursuer)
 
         # --- Update Histories ---
-        PlannerAgent.tom_history.append(tom)
-        if len(PlannerAgent.tom_history) > PlannerAgent.history_length:
-            PlannerAgent.tom_history.pop(0)
+        PlannerAgent.pursuer_history.append(pursuer)
+        if len(PlannerAgent.pursuer_history) > PlannerAgent.history_length:
+            PlannerAgent.pursuer_history.pop(0)
 
-        PlannerAgent.spike_history.append(spike)
-        if len(PlannerAgent.spike_history) > PlannerAgent.history_length:
-            PlannerAgent.spike_history.pop(0)
+        PlannerAgent.target_history.append(target)
+        if len(PlannerAgent.target_history) > PlannerAgent.history_length:
+            PlannerAgent.target_history.pop(0)
 
         # --- Predict Positions ---
-        predicted_spike = PlannerAgent.predict_agent(spike, PlannerAgent.spike_history, tom, world)  # Spike chases Tom
-        predicted_tom = PlannerAgent.predict_agent(tom, PlannerAgent.tom_history, cur, world)    # Tom chases Jerry
+        predicted_pursuer = PlannerAgent.predict_agent(pursuer, PlannerAgent.pursuer_history, cur, world)
 
-        # --- Loop Detection (Jerry-Spike) ---
-        PlannerAgent.last_positions.append((cur, spike)) # Use original positions, not predictions
+        # --- Loop Detection ---
+        PlannerAgent.last_positions.append((cur, target))
         if len(PlannerAgent.last_positions) > 6:
             PlannerAgent.last_positions.pop(0)
-        if PlannerAgent.last_positions.count((cur, spike)) >= 3:
+        if PlannerAgent.last_positions.count((cur, target)) >= 3:
             valid_moves = [
                 a for a in PlannerAgent.get_all_actions()
                 if PlannerAgent.is_valid((cur[0] + a[0], cur[1] + a[1]), world)
@@ -132,28 +147,41 @@ class PlannerAgent:
                 return valid_moves[np.random.randint(len(valid_moves))]
             return np.array([0, 0])
 
-        # --- Tom Avoidance ---
-        dist_to_tom = PlannerAgent.manhattan(cur, predicted_tom) # Use predicted_tom
-        avoid_tom = dist_to_tom <= 4
+        # --- 2-Step Lookahead Evaluation ---
+        best_score = -float('inf')
+        best_move = np.array([0, 0])
 
-        # --- Trap Detection (Spike) ---
-        spike_escape_routes = PlannerAgent.count_escape_routes(predicted_spike, world) # Use predicted_spike
-        trap_mode = spike_escape_routes <= 3
+        for move in PlannerAgent.get_all_actions():
+            next = tuple(current + move)
+            if not PlannerAgent.is_valid(next, world):
+                continue
 
-        # --- Flanking Bias ---
-        vec_spike_to_tom = np.array(predicted_tom) - np.array(predicted_spike)
-        vec_jerry_to_spike = np.array(predicted_spike) - np.array(cur)
-        flanking_penalty = 0
-        if np.dot(vec_spike_to_tom, vec_jerry_to_spike) > 0:
-            flanking_penalty = 1.0
+            # Predict target's move: greedy toward pursuer
+            best_target = target
+            best_dist = PlannerAgent.manhattan(target, pursuer)
+            for smove in PlannerAgent.get_all_actions():
+                next_target = (target[0] + smove[0], target[1] + smove[1])
+                if not PlannerAgent.is_valid(next_target, world):
+                    continue
+                d = PlannerAgent.manhattan(next_target, pursuer)
+                if d < best_dist:
+                    best_target = next_target
+                    best_dist = d
 
-        # --- Time-Based Aggression ---
-        time_aggression = max(0, len(PlannerAgent.last_positions) - 50)
+            # Score the resulting state
+            dist_to_target = PlannerAgent.manhattan(next, best_target)
+            dist_to_pursuer = PlannerAgent.manhattan(next, predicted_pursuer)
 
-        # --- Plan Path to Predicted Spike (using A*) ---
-        move = PlannerAgent.a_star(cur, predicted_spike, world, predicted_tom, avoid_tom=avoid_tom)
+            escape_score = PlannerAgent.count_escape_routes(next, world)
 
-        if move is None:
-            return np.array([0, 0])
+            # Heuristic: prioritize closing in on target, but stay away from pursuer
+            score = 0
+            score += 5 / (dist_to_target + 1)       # reward chasing target
+            score -= 5 / (dist_to_pursuer + 1)         # penalize being near pursuer
+            score += 0.5 * escape_score            # reward flexibility
 
-        return move
+            if score > best_score:
+                best_score = score
+                best_move = move
+
+        return best_move
