@@ -118,7 +118,7 @@ class PlannerAgent:
         target = tuple(pursued)
         purs = tuple(pursuer)
 
-        # --- Update Histories ---
+        #  Update Histories 
         self.pursuer_history.append(purs)
         if len(self.pursuer_history) > self.history_length:
             self.pursuer_history.pop(0)
@@ -127,10 +127,10 @@ class PlannerAgent:
         if len(self.target_history) > self.history_length:
             self.target_history.pop(0)
 
-        # --- Predict Pursuer ---
+        #  Predict Pursuer 
         predicted_pursuer = self.predict_agent(purs, self.pursuer_history, cur, world)
 
-        # --- Loop Detection ---
+        #  Loop Detection 
         self.last_positions.append((cur, target))
         if len(self.last_positions) > 6:
             self.last_positions.pop(0)
@@ -143,7 +143,7 @@ class PlannerAgent:
                 return valid_moves[np.random.randint(len(valid_moves))]
             return np.array([0, 0])
 
-        # --- Lookahead Evaluation
+        #  Lookahead Evaluation
         best_score = -float('inf')
         best_move = np.array([0, 0])
 
