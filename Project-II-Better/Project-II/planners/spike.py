@@ -35,7 +35,6 @@ class PlannerAgent:
 
     def predict_agent(self, current_pos: Tuple[int, int], history: List[Tuple[int, int]],
                       goal: Tuple[int, int], world: np.ndarray) -> Tuple[int, int]:
-        # Greedy 1-step prediction
         best_pos = current_pos
         best_dist = self.manhattan(current_pos, goal)
         for n in self.neighbors(current_pos, world):
