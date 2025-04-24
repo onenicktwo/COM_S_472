@@ -125,8 +125,27 @@ class Task:
 
 if __name__ == "__main__":
     # Test all grid tasks with each task tested for 5 times
+    losses = 0
+    ties = 0
+    tom_wins = 0
+    spike_wins = 0
+    wins = 0
     for id in range(100):
         for running_id in range(5):
             T = Task(id, running_id)
             result = T.run()
-            print (id, running_id, result)
+            if (result[1] == 3):
+                wins += 1
+            elif (result[1] == 1):
+                ties += 1
+            elif (result[1] == 0 and result[0] == 3):
+                losses += 1
+                tom_wins += 1
+            elif (result[1] == 0 and result[2] == 3):
+                losses += 1
+                spike_wins += 1
+            elif (result[1] == 0):
+                losses += 1
+            print(id, running_id, result, flush=True)
+    print(wins, ties, losses)
+    print(tom_wins, spike_wins)
