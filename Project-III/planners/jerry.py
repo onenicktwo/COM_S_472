@@ -1,255 +1,131 @@
+from heapq import heappush, heappop
+from collections import deque
 import numpy as np
+from typing import Tuple, Optional
 
-# Current Scoring
-# jerry=123 * 3 + 102=471 tom=46 * 3 + (275 - 46)=367 spike=40 * 3 + (275 - 40)=355
-# jerry wins=123 jerry ties=102 jerry losses=275
-# tom wins=46 spike wins=40
-# Self kills = 275 - 46 - 40 = 189
+P_LEFT, P_STR, P_RIGHT = 0.4, 0.3, 0.3
+ROT_P = np.array([P_LEFT, P_STR, P_RIGHT], dtype=np.float32)
 
+MOVES = np.array(
+    [[ 0, 0],[-1, 0],[ 1, 0],[ 0,-1],[ 0, 1],
+     [-1,-1],[-1, 1],[ 1,-1],[ 1, 1]],
+    dtype=np.int8)
+N_MOVE = len(MOVES)
 
-# Possible Optimizations
+ROT = np.stack([
+    np.stack([[-d[1],  d[0]] for d in MOVES]),   # left 90°
+    MOVES.copy(),                                # straight
+    np.stack([[ d[1], -d[0]] for d in MOVES])    # right 90°
+])                                               # (3,9,2)
 
-# target trapping:  Add a function that scores positions based on: 
-# How many directions Spike can still move 
-# Whether Jerry is cutting off those directions
-
-# tie avoidance reward: Add a “tie prediction” heuristic:
-# If we’re within 10 steps of max_iter
-# And distance to Spike is constant
-# And no captures are likely
-# Impl: Add a step_count input to plan_action If near timeout, relax crash threshold to allow bolder moves
-
-# Rollout Diversity: Try sampling different actions in the rollout itself (i.e., mini rollouts from the resulting state).
-
-# Stochastic-Aware Greedy Move: When choosing a move toward a target prefer directions that are safe even if rotated
-# Make greedy_move() prefer directions with lower crash risk in adjacent cells.
+def inb(p): return 0 <= p[0] < 30 and 0 <= p[1] < 30
+def mhd(a,b): return abs(int(a[0]-b[0])) + abs(int(a[1]-b[1]))
 
 class PlannerAgent:
-    def __init__(self, depth=3, rollouts=5):
-        self.depth = depth
-        self.rollouts = rollouts
+    """
+    Decision flow
+    1.  Build / reuse SAFE[r,c,move] :  True  iff *all three* noisy
+        outcomes are obstacle-free and on the board.
+    2.  If Tom is within 3 Manhattan →  ‘panic mode’: choose the safe move that
+        maximises   2·dist_to_Tom – dist_to_Spike .
+    3.  Else compute an A* path to Spike **using only safe moves**.
+        If path found  → take its first step.
+    4.  If no A* path (Spike boxed)   → doorway-closing heuristic:
+        pick safe move that minimises Spike’s 4-neighbour exit count,
+        breaking ties with distance heuristic.
+    All steps are O(900) or less ⇒  < 1 ms.
+    """
 
-        self.actions = [
-            np.array([0, 1]),  # right
-            np.array([1, 0]),  # down
-            np.array([0, -1]), # left
-            np.array([-1, 0]), # up
-            np.array([0, 0])   # stay
-        ]
-        self.prob = [0.3, 0.3, 0.4]
-        self.last_positions = []
+    def __init__(self):
+        self.safe  = None     # 30x30x9 bool
+        self.sig   = None
+        self.OPEN  = []       # A* priority queue reused to avoid realloc
 
-    def plan_action(self, world, current, pursued, pursuer):
-        best_score = -np.inf
-        best_action = np.array([0, 0])
+    # ----------------------------------------------------------
+    def plan_action(self,
+                    world : np.ndarray,
+                    cur   : Tuple[int,int],
+                    prey  : Tuple[int,int],
+                    purs  : Tuple[int,int]) -> Optional[np.ndarray]:
 
-        self.last_dist_to_target = np.sum(np.abs(current - pursued))
-        self.last_dist_from_chaser = np.sum(np.abs(current - pursuer))
-        self.last_positions.append(tuple(current))
-        if len(self.last_positions) > 15:
-            self.last_positions.pop(0)
+        if self.sig != hash(world.tobytes()):
+            self._build_safe_table(world)
 
-        for action in self.actions:
-            crash_risk = self.expected_crash_risk(world, current, action)
-            dist_to_target = np.sum(np.abs(current - pursued))
-            safe_moves = self.count_safe_directions(world, current)
+        C = np.asarray(cur,   np.int8)
+        S = np.asarray(prey,  np.int8)
+        T = np.asarray(purs,  np.int8)
+        safe_row = self.safe[C[0],C[1]]           # (9,) bool
 
-            # Dynamic crash threshold
-            if dist_to_target <= 2:
-                crash_threshold = 0.6
-            elif dist_to_target <= 4:
-                crash_threshold = 0.4
-            else:
-                crash_threshold = 0.3
+        # panic mode if Tom is close
+        if mhd(C, T) <= 3:
+            best, best_val = MOVES[0], -1e9
+            for idx, mv in enumerate(MOVES):
+                if not safe_row[idx]: continue
+                nxt = C + mv
+                val = 2*mhd(nxt, T) - mhd(nxt, S)
+                if val > best_val:
+                    best_val = val; best = mv
+            return best
 
-            # Absolute safety checks
-            if crash_risk > 0.7:
-                continue  # always skip very risky actions
-            if safe_moves <= 2 and crash_risk > 0.3:
-                continue  # be ultra conservative in tight spaces
-            if crash_risk > crash_threshold:
-                continue  # dynamic threshold
+        # A* path (safe moves only)
+        path_mv = self._astar_first_step(world, C, S)
+        if path_mv is not None and safe_row[self._mv_idx(path_mv)]:
+            return path_mv
 
-            total_score = 0.0
-            for _ in range(self.rollouts):
-                score = self.simulate(world, current, pursued, pursuer, action)
-                total_score += score
-
-            avg_score = total_score / self.rollouts
-
-            # Crash penalty scaled by reward potential
-            if avg_score > 500:
-                avg_score -= 100 * crash_risk
-            else:
-                avg_score -= 300 * crash_risk
-
-            if avg_score > best_score:
-                best_score = avg_score
-                best_action = action
-
-        # Final safety check: ensure best action is not likely to crash in any rotation
-        if self.expected_crash_risk(world, current, best_action) > 0.7:
-            # Try to find a safer alternative (fallback)
-            for fallback in self.actions:
-                if self.expected_crash_risk(world, current, fallback) < 0.2:
-                    return fallback
-            return np.array([0, 0])  # worst case: stay put
-        else:
-            return best_action
-
-    def simulate(self, world, current, pursued, pursuer, base_action):
-        pos = np.array(current)
-        tar = np.array(pursued)
-        chaser = np.array(pursuer)
-
-        for _ in range(self.depth):
-            a = self.sample_stochastic_action(base_action)
-            next_pos = pos + a
-
-            if not self.valid(world, next_pos):
-                return -1000
-
-            pos = next_pos
-
-            if self.near_wall(world, tar):
-                tar = tar  # Spike stays still when near wall
-            elif np.random.rand() < 0.2:
-                tar = self.random_valid_move(world, tar)
-            else:
-                tar = self.greedy_move(world, tar, pos)
-
-            chaser = self.greedy_move(world, chaser, pos)
-
-            if np.array_equal(pos, tar):
-                return 1000
-            if np.array_equal(pos, chaser):
-                return -1000
-            if world[pos[0], pos[1]] == 1:
-                return -1000
-
-        return self.evaluate(pos, tar, chaser, world, current)
-
-    def evaluate(self, pos, target, chaser, world, current):
-        dist_to_target = np.sum(np.abs(pos - target))
-        dist_from_chaser = np.sum(np.abs(pos - chaser))
-
-        score = 0
-        score += -1.0 * dist_to_target
-        score += 1.5 * dist_from_chaser
-
-        # Progress toward Spike
-        progress = self.last_dist_to_target - dist_to_target
-        score += 2.0 * progress
-
-        # Escape from Tom
-        if dist_from_chaser > self.last_dist_from_chaser:
-            score += 2.0  # reward retreat
-        self.last_dist_from_chaser = dist_from_chaser
-
-        # Open space
-        escape_routes = self.count_safe_directions(world, pos)
-        score += escape_routes * 2
-
-        # Danger zone penalty
-        score -= self.danger_score(pos, chaser)
-
-        # Bonus for proximity to Spike
-        if dist_to_target <= 2:
-            # Only give bonus if not adjacent to wall (no easy crash)
-            if not self.near_wall(world, pos):
-                score += 300
-            else:
-                score += 100  # smaller bonus — be cautious
-
-        # Wall proximity penalty
-        if self.near_wall(world, pos):
-            score -= 2
-
-        # Discourage staying still
-        if np.array_equal(pos, current):
-            score -= 1.5
-
-        # Loop penalty
-        if self.last_positions.count(tuple(pos)) > 1:
-            score -= 10
-
-        score += np.random.uniform(-0.5, 0.5)
-
-        if dist_to_target <= 2 and self.near_wall(world, pos):
-            score -= 50
-
-        return score
-
-    def random_valid_move(self, world, pos):
-        np.random.shuffle(self.actions)
-        for d in self.actions:
-            new = pos + d
-            if self.valid(world, new):
-                return new
-        return pos
-
-    def count_safe_directions(self, world, pos):
-        count = 0
-        for d in self.actions[:-1]:
-            neighbor = pos + d
-            if self.valid(world, neighbor):
-                count += 1
-        return count
-
-    def danger_score(self, pos, chaser):
-        dist = np.sum(np.abs(pos - chaser))
-        if dist <= 1:
-            return 100
-        elif dist == 2:
-            return 30
-        elif dist == 3:
-            return 10
-        else:
-            return 0
-
-    def expected_crash_risk(self, world, current, action):
-        variants = [
-            (np.array([-action[1], action[0]]), self.prob[0]),  # left
-            (action, self.prob[1]),                             # straight
-            (np.array([action[1], -action[0]]), self.prob[2])   # right
-        ]
-        crash_risk = 0.0
-        for a, p in variants:
-            next_pos = current + a
-            if not self.valid(world, next_pos):
-                crash_risk += p
-        return crash_risk
-
-    def sample_stochastic_action(self, action):
-        choice = np.random.choice(3, p=self.prob)
-        if choice == 1:
-            return action
-        elif choice == 0:
-            return np.array([-action[1], action[0]])
-        else:
-            return np.array([action[1], -action[0]])
-
-    def valid(self, world, pos):
-        r, c = pos
-        rows, cols = world.shape
-        return 0 <= r < rows and 0 <= c < cols and world[r, c] != 1
-
-    def near_wall(self, world, pos):
-        wall_count = 0
-        for d in self.actions[:-1]:
-            neighbor = pos + d
-            if not self.valid(world, neighbor):
-                wall_count += 1
-        return wall_count >= 2
-
-    def greedy_move(self, world, source, target):
-        best = source
-        best_dist = np.sum(np.abs(source - target))
-        for d in self.actions:
-            new = source + d
-            if self.valid(world, new):
-                dist = np.sum(np.abs(new - target))
-                if dist < best_dist:
-                    best = new
-                    best_dist = dist
+        #doorway-closing heuristic
+        exits0 = self._exit_count(world, S, C)
+        best,b_exit,b_score = MOVES[0], 9, -1e9
+        for idx, mv in enumerate(MOVES):
+            if not safe_row[idx]: continue
+            nxt = C + mv
+            ex  = self._exit_count(world, S, nxt)
+            score = 1.2*mhd(nxt, T) - mhd(nxt, S)
+            if ex < b_exit or (ex == b_exit and score > b_score):
+                best,b_exit,b_score = mv,ex,score
         return best
+
+    def _build_safe_table(self, world):
+        self.safe = np.zeros((30,30,N_MOVE), np.bool_)
+        wall = world==1
+        for r in range(30):
+            for c in range(30):
+                base = np.array([r,c], np.int8)
+                trio = base + ROT                       # (3,9,2)
+                rows, cols = trio[...,0], trio[...,1]
+                legal = (rows>=0)&(rows<30)&(cols>=0)&(cols<30)
+                legal &= ~wall[rows.clip(0,29), cols.clip(0,29)]
+                self.safe[r,c] = legal.all(axis=0)
+        self.sig = hash(world.tobytes())
+
+    def _astar_first_step(self, world, start, goal):
+        if np.array_equal(start, goal): return np.array([0,0], np.int8)
+        seen = np.full((30,30), 99, np.int8)
+        self.OPEN.clear()
+        heappush(self.OPEN, (mhd(start,goal), 0, tuple(start), -1))
+        while self.OPEN:
+            f,g,node,first_idx = heappop(self.OPEN)
+            if g >= 40: continue                      # depth cutoff
+            if seen[node] <= g: continue
+            seen[node] = g
+            if node == tuple(goal):
+                return MOVES[first_idx] if first_idx>=0 else np.array([0,0],np.int8)
+            r,c = node
+            for idx,mv in enumerate(MOVES):
+                if not self.safe[r,c,idx]: continue
+                nxt = (r+mv[0], c+mv[1])
+                if seen[nxt] <= g+1: continue
+                h = mhd(nxt, goal)
+                heappush(self.OPEN, (g+1+h, g+1, nxt, idx if first_idx==-1 else first_idx))
+        return None   # no path
+
+    @staticmethod
+    def _exit_count(world, S, J_new):
+        exits = 0
+        for dr,dc in ((1,0),(-1,0),(0,1),(0,-1)):
+            nr,nc = S[0]+dr, S[1]+dc
+            if 0<=nr<30 and 0<=nc<30 and world[nr,nc]==0 and (nr,nc)!=tuple(J_new):
+                exits += 1
+        return exits
+
+    @staticmethod
+    def _mv_idx(mv): return int(np.where((MOVES==mv).all(axis=1))[0][0])
