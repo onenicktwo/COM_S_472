@@ -41,7 +41,6 @@ class PlannerAgent:
         self.sig   = None
         self.OPEN  = []       # A* priority queue reused to avoid realloc
 
-    # ----------------------------------------------------------
     def plan_action(self,
                     world : np.ndarray,
                     cur   : Tuple[int,int],
@@ -72,7 +71,7 @@ class PlannerAgent:
         if path_mv is not None and safe_row[self._mv_idx(path_mv)]:
             return path_mv
 
-        #doorway-closing heuristic
+        # doorway-closing heuristic
         exits0 = self._exit_count(world, S, C)
         best,b_exit,b_score = MOVES[0], 9, -1e9
         for idx, mv in enumerate(MOVES):
@@ -90,12 +89,13 @@ class PlannerAgent:
         for r in range(30):
             for c in range(30):
                 base = np.array([r,c], np.int8)
-                trio = base + ROT                       # (3,9,2)
+                trio = base + ROT
                 rows, cols = trio[...,0], trio[...,1]
                 legal = (rows>=0)&(rows<30)&(cols>=0)&(cols<30)
                 legal &= ~wall[rows.clip(0,29), cols.clip(0,29)]
                 self.safe[r,c] = legal.all(axis=0)
         self.sig = hash(world.tobytes())
+
 
     def _astar_first_step(self, world, start, goal):
         if np.array_equal(start, goal): return np.array([0,0], np.int8)
