@@ -1,223 +1,269 @@
+import numpy as np
 from heapq import heappush, heappop
 from collections import deque
-import numpy as np
 from typing import Tuple, Optional
-from concurrent.futures import ProcessPoolExecutor
-import atexit
 
-POOL = ProcessPoolExecutor(max_workers=9)
-atexit.register(lambda: POOL.shutdown(wait=False))
-
-# stochastic rotations
-P_LEFT, P_STR, P_RIGHT = 0.4, 0.3, 0.3
-ROT_P = np.array([P_LEFT, P_STR, P_RIGHT], dtype=np.float32)
-
-# moves (stay, 4-axis, 4-diag)
-MOVES = np.array(
-    [[ 0, 0],[-1, 0],[ 1, 0],[ 0,-1],[ 0, 1],
-     [-1,-1],[-1, 1],[ 1,-1],[ 1, 1]], dtype=np.int8)
-N_MOVE = len(MOVES)
-
-# pre-build rotation tables
+# motion tables
+MOVES = np.array([[0, 0], [-1, 0], [1, 0], [0,-1], [0, 1],
+                  [-1,-1],[-1, 1],[1,-1],[1, 1]], dtype=np.int8)
 ROT = np.stack([
-    np.stack([[-d[1],  d[0]] for d in MOVES]),   # left
-    MOVES.copy(),                                # straight
-    np.stack([[ d[1], -d[0]] for d in MOVES])    # right
+    np.stack([[-d[1],  d[0]] for d in MOVES]),
+    MOVES,
+    np.stack([[ d[1], -d[0]] for d in MOVES])
 ])
 
-# utility constants
-CAPTURE_BONUS =  10.0
-CRASH_PENALTY = -12.0
-G_DIST        =   0.6
+# heuristic weights
+CAPTURE_BONUS  = 64.0
+CRASH_PENALTY  = -1200.0
+W_PREY         =  1.0
+W_PURS         =  1.2
+STAY_BIAS      = -0.04
+RISK_COST      =  40.0
 
-# risk policy: static 12 % threshold
-RISK_TH = 0.12
+# safety policy
+RISK_TH_BASE   = 0.12
+RISK_TH_MAX    = 0.28
+ADAPT_RATE     = 0.03
 
-# misc parameters
-STALL_LIMIT = 25
+# misc
+STALL_LIMIT = 10
 HISTORY     = 30
-
-# helpers
 def in_bounds(p): return 0 <= p[0] < 30 and 0 <= p[1] < 30
-def mhd(a,b):     return abs(int(a[0]-b[0])) + abs(int(a[1]-b[1]))
-
-# worker for the process pool
-def ev_worker(args):
-    mv, C, S, T, world_flat = args
-    world = world_flat.reshape(30, 30)
-    mv_idx = np.where((MOVES == mv).all(axis=1))[0][0]
-
-    e_vals = []
-    for r in range(3):
-        nxt = C + ROT[r, mv_idx]
-
-        # hard outcomes
-        if (not in_bounds(nxt)) or world[nxt[0], nxt[1]]:
-            e_vals.append(CRASH_PENALTY)
-        elif (nxt == T).all():
-            e_vals.append(CRASH_PENALTY)
-        elif (nxt == S).all():
-            e_vals.append(CAPTURE_BONUS)
-        else:  # soft heuristic
-            e_vals.append(G_DIST * (mhd(nxt, T) - mhd(nxt, S)) / 30.0)
-
-    e_vals = np.asarray(e_vals, np.float32)
-    ev  = (ROT_P * e_vals).sum()
-    var = (ROT_P * (e_vals - ev) ** 2).sum()
-    return mv, ev, var
-
+def mhd(a,b):    return abs(int(a[0]-b[0])) + abs(int(a[1]-b[1]))
 
 class PlannerAgent:
     def __init__(self):
-        self.safe      = None
-        self.sig       = None
+        self.hit_any   = None          # bool 30×30×9   crash? (worst case)
+        self.risk      = None          # float 30×30×9  0 or 1
+        self.sig       = None          # hash(world)    to rebuild once
+        
+        self.rot_cnt   = np.ones(3, dtype=np.float32)  # Dirichlet(1,1,1)
+        self.rot_p     = self.rot_cnt / self.rot_cnt.sum()
+
+        self.prev_pos  = None
+        self.prev_cmd  = None
+       
         self.open_ast  = []
         self.exit_hist = deque(maxlen=HISTORY)
         self.stall_cnt = 0
+        self.idle_steps= 0
 
     # main API
-    def plan_action(
-        self,
-        world : np.ndarray,
-        cur   : Tuple[int,int],
-        prey  : Tuple[int,int],
-        purs  : Tuple[int,int]) -> Optional[np.ndarray]:
+    def plan_action(self,
+                    world  : np.ndarray,
+                    cur    : Tuple[int,int],
+                    prey   : Tuple[int,int],
+                    purs   : Tuple[int,int]) -> Optional[np.ndarray]:
 
-        # rebuild safe table if grid changes
+        # 1) rebuild crash tables once per arena
         if self.sig != hash(world.tobytes()):
-            self._build_safe_table(world)
+            self._build_risk_tables(world)
             self.exit_hist.clear()
-            self.stall_cnt = 0
+            self.stall_cnt  = 0
+            self.idle_steps = 0
 
-        C = np.asarray(cur,  np.int8)
-        S = np.asarray(prey, np.int8)
-        T = np.asarray(purs, np.int8)
-        safe_row = self.safe[C[0], C[1]]
+        C = np.asarray(cur ,np.int8)
+        S = np.asarray(prey,np.int8)
+        T = np.asarray(purs,np.int8)
 
-        # stall bookkeeping
-        exits_now = self._exit_count(world, S, C)
+        # 2) update our rotation-probability estimate from last turn
+        self._update_rot_estimate(C)
+
+        dyn_th = min(RISK_TH_BASE + ADAPT_RATE*self.idle_steps, RISK_TH_MAX)
+        if (self.risk[C[0],C[1],1:] <= dyn_th).sum() == 0:
+            dyn_th = min(self.risk[C[0],C[1],1:].min() + 1e-4, RISK_TH_MAX)
+
+        risk_row = self.risk[C[0],C[1]]
+        safe_row = risk_row <= dyn_th
+
+        # 0. “Lunge” opportunistic capture 
+        mv_lunge = self._lunge_if_profitable(C,S,T,risk_row)
+        if mv_lunge is not None:
+            self.prev_cmd = mv_lunge
+            self.prev_pos = C.copy()
+            return mv_lunge
+
+        # bookkeeping for stall / idle detectors
+        self.idle_steps = self.idle_steps + 1 if safe_row[1:].sum() == 0 else 0
+        exits_now       = self._exit_count(world,S,C)
         self.exit_hist.append(exits_now)
         if len(self.exit_hist) == self.exit_hist.maxlen:
-            if exits_now >= min(self.exit_hist):
-                self.stall_cnt += 1
-            else:
-                self.stall_cnt = 0
+            self.stall_cnt = self.stall_cnt + 1 if exits_now >= min(self.exit_hist) else 0
 
-        # 1. flee if pursuer is close
-        if mhd(C, T) <= 3:
-            return self._flee_move(C, S, T, safe_row)
+        # 1. flee if predator is close
+        if mhd(C,T) <= 3:
+            act = self._flee(C,S,T,safe_row)
+            self.prev_cmd, self.prev_pos = act, C.copy()
+            return act
 
-        # 2. safe-A* step toward prey
-        mv_ast = self._astar_first_step(world, C, S)
-        if mv_ast is not None and safe_row[self._mv_idx(mv_ast)]:
-            return mv_ast
+        # 2. A* towards prey under safety threshold
+        step = self._astar(world,C,S,dyn_th)
+        if step is not None and safe_row[self._idx(step)]:
+            self.prev_cmd, self.prev_pos = step, C.copy()
+            return step
 
-        # 3. choke-move when stalled
+        # 3. choke manoeuvre to reduce prey exits if we’re stalling
         if self.stall_cnt >= STALL_LIMIT:
-            mv = self._choke_move(C, S, safe_row, world)
             self.stall_cnt = 0
-            return mv
+            act = self._choke(C,S,safe_row,world)
+            self.prev_cmd, self.prev_pos = act, C.copy()
+            return act
 
-        # 4. expectimax local choice
-        return self._expectimax_move(world, C, S, T)
+        # 4. expectimax with EV filtering
+        act = self._expectimax(world,C,S,T,safe_row,risk_row)
+        self.prev_cmd, self.prev_pos = act, C.copy()
+        return act
 
-    # tables
-    def _build_safe_table(self, world):
-        wall  = world == 1
-        safe  = np.zeros((30,30,N_MOVE), np.bool_)
+    # Build worst-case crash table
+    def _build_risk_tables(self, world):
+        wall = (world == 1)
+        base = np.indices((30,30)).transpose(1,2,0)          # 30×30×2
+        trio = base[...,None,None,:] + ROT                    # 30×30×3×9×2
+        r, c = trio[...,0], trio[...,1]
 
-        for r in range(30):
-            for c in range(30):
-                base = np.array([r, c], np.int8)
-                trio = base + ROT
-                rows, cols = trio[...,0], trio[...,1]
+        hit = (~((r>=0)&(r<30)&(c>=0)&(c<30)) | wall[r.clip(0,29), c.clip(0,29)])  # bool 30×30×3×9
 
-                in_bd  = (rows>=0)&(rows<30)&(cols>=0)&(cols<30)
-                hit    = np.logical_not(in_bd) | wall[rows.clip(0,29),
-                                                      cols.clip(0,29)]
+        self.hit_any = hit.any(2)                       # 30×30×9  (True if *any* rotation crashes)
+        self.risk    = self.hit_any.astype(np.float32)  # 0.0  or  1.0
+        self.sig     = hash(world.tobytes())
 
-                risk = (ROT_P[:,None] * hit).sum(axis=0)
-                safe[r,c] = risk <= RISK_TH
+    # Online learning of rotation probabilities
+    def _update_rot_estimate(self, cur_pos: np.ndarray):
+        if self.prev_pos is None or self.prev_cmd is None:
+            self.prev_pos = cur_pos.copy()
+            return
 
-        self.safe = safe
-        self.sig  = hash(world.tobytes())
+        delta = cur_pos - self.prev_pos
+        for rot_idx in range(3):
+            if np.array_equal(delta, ROT[rot_idx, self._idx(self.prev_cmd)]):
+                self.rot_cnt[rot_idx] += 1
+                self.rot_p = self.rot_cnt / self.rot_cnt.sum()
+                break
+        self.prev_pos = cur_pos.copy()
 
-    # A* (bounds-safe)
-    def _astar_first_step(self, world, start, goal):
+    def _lunge_if_profitable(self,C,S,T,risk_row):
+        idx_best = int(risk_row.argmin())
+        if idx_best == 0 or risk_row[idx_best] > RISK_TH_MAX:
+            return None
+
+        p_crash = risk_row[idx_best]
+        p_cap   = 0.0
+        for rot, p in enumerate(self.rot_p):
+            if np.array_equal(C + ROT[rot, idx_best], S):
+                p_cap += p
+
+        if p_cap == 0: return None
+        delta = 3 if mhd(C,T) <= 2 else 2
+        if p_cap * delta > p_crash:
+            return MOVES[idx_best]
+        return None
+
+    # A* search
+    def _astar(self,world,start,goal,dyn_th):
         if np.array_equal(start, goal):
-            return np.array([0, 0], np.int8)
-
-        seen = np.full((30, 30), 99, np.int8)
+            return MOVES[0]
+        seen = np.full((30,30), 99, np.int8)
         self.open_ast.clear()
-        heappush(self.open_ast, (mhd(start, goal), 0, tuple(start), -1))
-
+        heappush(self.open_ast, (mhd(start,goal), 0, tuple(start), -1))
         while self.open_ast:
-            f, g, node, first = heappop(self.open_ast)
-            if g >= 40: continue
-            if seen[node] <= g: continue
+            f,g,node,first = heappop(self.open_ast)
+            if g >= 40 or seen[node] <= g:
+                continue
             seen[node] = g
-
             if node == tuple(goal):
-                return MOVES[first] if first >= 0 else np.array([0, 0], np.int8)
-
-            r, c = node
-            for idx, mv in enumerate(MOVES):
-                if not self.safe[r, c, idx]:
+                return MOVES[first] if first >= 0 else MOVES[0]
+            r,c = node
+            for idx,mv in enumerate(MOVES):
+                if self.risk[r,c,idx] > dyn_th:
                     continue
-                nxt = (r + mv[0], c + mv[1])
+                nxt = (r+mv[0], c+mv[1])
                 if not in_bounds(nxt) or world[nxt]:
                     continue
-                if seen[nxt] <= g + 1:
+                if seen[nxt] <= g+1:
                     continue
-                heappush(self.open_ast,
-                         (g + 1 + mhd(nxt, goal), g + 1, nxt,
+                heappush(self.open_ast, (g+1+mhd(nxt,goal), g+1, nxt,
                           idx if first == -1 else first))
         return None
 
-    # local heuristics
-    def _flee_move(self, C, S, T, safe_row):
-        best_mv, best_val = MOVES[0], -1e9
-        for idx, mv in enumerate(MOVES):
-            if not safe_row[idx]: continue
-            nxt = C + mv
-            val = 2 * mhd(nxt, T) - mhd(nxt, S)
-            if val > best_val:
-                best_val, best_mv = val, mv
-        return best_mv
+    # expectimax
+    def _expectimax(self,world,C,S,T,safe_row,risk_row):
+        ev1,_ = self._ev_all(world,C,S,T)
+        risk_pen = self._adaptive_risk_cost(C,S)
+        ev1 -= risk_pen * risk_row
+        ev1[0] += STAY_BIAS
 
-    def _choke_move(self, C, S, safe_row, world):
-        base_exits = self._exit_count(world, S, C)
-        best_mv, best_val = MOVES[0], base_exits
-        for idx, mv in enumerate(MOVES):
-            if not safe_row[idx]: continue
-            nxt = C + mv
-            ex  = self._exit_count(world, S, nxt)
-            if ex < best_val or (ex == best_val and mhd(nxt, S) < mhd(best_mv + C, S)):
-                best_mv, best_val = mv, ex
-        return best_mv
+        best3 = np.argsort(-ev1)[:3]
+        for idx in best3:
+            if risk_row[idx] > RISK_TH_MAX or not safe_row[idx]:
+                ev1[idx] = -1e9
+                continue
+            C2 = C + MOVES[idx]
+            if not in_bounds(C2) or world[tuple(C2)]:
+                ev1[idx] += 0.25 * CRASH_PENALTY
+                continue
+            ev2,_ = self._ev_all(world,C2,S,T)
+            ev2 -= risk_pen * self.risk[C2[0],C2[1]]
+            ev1[idx] = 0.7*ev1[idx] + 0.3*ev2.max()
+        return MOVES[int(ev1.argmax())]
 
-    def _expectimax_move(self, world, C, S, T):
-        world_flat = world.ravel()
-        futures = [POOL.submit(ev_worker, (mv, C, S, T, world_flat))
-                   for mv in MOVES]
+    # EV table
+    def _ev_all(self,world,C,S,T):
+        nxt = C + ROT
+        r,c = nxt[...,0], nxt[...,1]
+        hit = (~((r>=0)&(r<30)&(c>=0)&(c<30)) |
+               world[r.clip(0,29), c.clip(0,29)])
+        d_prey = np.abs(r-S[0]) + np.abs(c-S[1])
+        d_purs = np.abs(r-T[0]) + np.abs(c-T[1])
+        h = np.where(hit, CRASH_PENALTY,
+             np.where((r==S[0])&(c==S[1]), CAPTURE_BONUS,
+             np.where((r==T[0])&(c==T[1]), CRASH_PENALTY,
+                      -W_PREY*d_prey + W_PURS*d_purs)))
+        ev  = (self.rot_p[:,None]*h).sum(0)
+        var = (self.rot_p[:,None]*(h-ev)**2).sum(0)
+        return ev, var
 
-        best_mv, best_ev, best_var = MOVES[0], -1e9, 1e9
-        for f in futures:
-            mv, ev, var = f.result()
-            if ev > best_ev + 1e-6 or (abs(ev - best_ev) <= 1e-6 and var < best_var):
-                best_mv, best_ev, best_var = mv, ev, var
-        return best_mv
+    # adaptive risk cost, flee, choke
+    def _adaptive_risk_cost(self,C,S):
+        d = mhd(C,S)
+        return RISK_COST * (0.5 if d <= 6 else 1.0)
 
-    # minor utils
+    def _flee(self,C,S,T,safe_row):
+        best = -1e9
+        mv   = MOVES[0]
+        for idx,m in enumerate(MOVES):
+            if self.risk[C[0],C[1],idx] > RISK_TH_MAX or not safe_row[idx]:
+                continue
+            nxt = C + m
+            v   = 2*mhd(nxt,T) - mhd(nxt,S)
+            if v > best:
+                best = v
+                mv   = m
+        return mv
+
+    def _choke(self,C,S,safe_row,world):
+        base = self._exit_count(world,S,C)
+        best = base
+        mv   = MOVES[0]
+        for idx,m in enumerate(MOVES):
+            if self.risk[C[0],C[1],idx] > RISK_TH_MAX or not safe_row[idx]:
+                continue
+            nxt = C + m
+            ex  = self._exit_count(world,S,nxt)
+            if ex < best or (ex == best and mhd(nxt,S) < mhd(mv+C,S)):
+                best = ex
+                mv   = m
+        return mv
+
+    # misc
     @staticmethod
-    def _exit_count(world, S, pos):
-        exits = 0
-        for dr, dc in ((1,0),(-1,0),(0,1),(0,-1)):
-            nr, nc = S[0] + dr, S[1] + dc
-            if 0 <= nr < 30 and 0 <= nc < 30 and world[nr, nc] == 0 and (nr, nc) != tuple(pos):
-                exits += 1
-        return exits
+    def _exit_count(world,S,pos):
+        e = 0
+        for dr,dc in ((1,0),(-1,0),(0,1),(0,-1)):
+            nr,nc = S[0]+dr, S[1]+dc
+            if 0 <= nr < 30 and 0 <= nc < 30 and world[nr,nc] == 0 and (nr,nc) != tuple(pos):
+                e += 1
+        return e
 
     @staticmethod
-    def _mv_idx(mv):
-        return int(np.where((MOVES == mv).all(axis=1))[0][0])
+    def _idx(mv):
+        return int(np.where((MOVES == mv).all(1))[0][0])

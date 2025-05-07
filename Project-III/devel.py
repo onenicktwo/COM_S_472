@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
 # === CONFIGURATION ===
-task_id = 0
-run_id = 1
+task_id = 1
+run_id = 2
 grid_path = f"data/grid_files/grid_{task_id}.npy"
 log_path = f"data/proj_iii_solutions/{task_id}_{run_id}.csv"
 
